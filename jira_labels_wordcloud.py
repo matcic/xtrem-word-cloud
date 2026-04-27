@@ -7,7 +7,10 @@ reads the Labels column (and falls back to <td class="labels"> on HTML exports).
 
 Usage:
   pip install pandas lxml beautifulsoup4 matplotlib wordcloud openpyxl
-  python tools/jira_labels_wordcloud.py "/path/to/Jira....xls" -o labels.png
+  python jira_labels_wordcloud.py "/path/to/Jira....xls" -o labels.png
+
+Writes two PNGs: labels-feature.png and labels-field.png (only `feature_*` and `field_*`
+labels; prefixes are stripped and the remainder is shown in camelCase).
 """
 
 from __future__ import annotations
@@ -30,13 +33,11 @@ def _find_labels_column(df):
         s = str(c).strip().lower()
         if s == "labels":
             return c
-    for c in df.columns:
-        if "label" in str(c).lower():
-            return c
     return None
 
 
 def _load_frame_from_excel(path: Path):
+    print("Loading frame from Excel")
     import pandas as pd  # noqa: PLC0415
 
     for engine in ("openpyxl", "calamine", "xlrd"):
@@ -55,6 +56,7 @@ def load_label_strings(path: Path) -> list[str]:
 
     # Jira HTML export disguised as .xls / .xls
     if head.startswith(b"<") or b"issuetable" in raw[:8192]:
+        print("Jira HTML export detected")
         text = raw.decode("utf-8", errors="replace")
 
         try:
@@ -72,6 +74,7 @@ def load_label_strings(path: Path) -> list[str]:
             pass
 
         try:
+            print("BeautifulSoup detected")
             from bs4 import BeautifulSoup
 
             soup = BeautifulSoup(text, "lxml")
@@ -93,11 +96,7 @@ def load_label_strings(path: Path) -> list[str]:
         df = pd.read_csv(path)
         col = _find_labels_column(df)
         if col is not None:
-            return [
-                str(x).strip()
-                for x in df[col]
-                if pd.notna(x) and str(x).strip()
-            ]
+            return [str(x).strip() for x in df[col] if pd.notna(x) and str(x).strip()]
 
     return []
 
@@ -108,18 +107,97 @@ def split_jira_labels(cell: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
-def build_frequencies(cells: list[str]) -> dict[str, int]:
-    c: Counter[str] = Counter()
+def _suffix_to_camel_case(suffix: str) -> str:
+    """Turn text after feature_/field_ into lower camelCase (snake segments → camel)."""
+    suffix = suffix.strip()
+    if not suffix:
+        return ""
+    parts = [p for p in suffix.split("_") if p]
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        p = parts[0]
+        return (p[0].lower() + p[1:]) if p else ""
+    first = parts[0].lower()
+    rest = "".join(
+        (seg[0].upper() + seg[1:].lower()) if seg else "" for seg in parts[1:]
+    )
+    return first + rest
+
+
+def _strip_prefix_casefold(label: str, prefix: str) -> str | None:
+    if label.casefold().startswith(prefix.casefold()):
+        return label[len(prefix) :]
+    return None
+
+
+def build_feature_field_frequencies(
+    cells: list[str],
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Count only labels starting with feature_ or field_; keys are camelCase suffixes."""
+    feature_c: Counter[str] = Counter()
+    field_c: Counter[str] = Counter()
+    feature_p, field_p = "feature_", "field_"
     for cell in cells:
         for label in split_jira_labels(cell):
-            c[label] += 1
-    return dict(c)
+            rest = _strip_prefix_casefold(label, feature_p)
+            if rest is not None:
+                key = _suffix_to_camel_case(rest)
+                if key:
+                    feature_c[key] += 1
+                continue
+            rest = _strip_prefix_casefold(label, field_p)
+            if rest is not None:
+                key = _suffix_to_camel_case(rest)
+                if key:
+                    field_c[key] += 1
+    return dict(feature_c), dict(field_c)
+
+
+def _print_occurrence_table(title: str, freqs: dict[str, int]) -> None:
+    print()
+    print(title)
+    if not freqs:
+        print("  (none)")
+        return
+    rows = sorted(freqs.items(), key=lambda kv: (-kv[1], kv[0].casefold()))
+    label_w = max(len(label) for label, _ in rows)
+    label_w = max(label_w, len("Label"))
+    print(f"{'Label':<{label_w}}  Count")
+    print(f"{'-' * label_w}  -----")
+    for label, count in rows:
+        print(f"{label:<{label_w}}  {count}")
+
+
+WORDCLOUD_COLORS = (
+    "#00A65C",
+    "#006362",
+    "#00293F",
+    "#4A1828",
+    "#A13829",
+    "#E98709",
+)
+
+
+def _wordcloud_color_func(
+    word, font_size, position, orientation, random_state=None, **kwargs
+):
+    n = len(WORDCLOUD_COLORS)
+    if random_state is None:
+        return WORDCLOUD_COLORS[0]
+    # Python Random.randint is inclusive on both ends; NumPy uses a half-open range.
+    randrange = getattr(random_state, "randrange", None)
+    if randrange is not None:
+        i = int(randrange(n))
+    elif hasattr(random_state, "integers"):
+        i = int(random_state.integers(0, n))
+    else:
+        i = int(random_state.randint(0, n))
+    return WORDCLOUD_COLORS[i]
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Word cloud from a Jira issue export’s Labels column."
-    )
+    parser = argparse.ArgumentParser(description="Word cloud from a Jira issue export.")
     parser.add_argument(
         "input_path",
         type=Path,
@@ -129,8 +207,8 @@ def main() -> int:
         "-o",
         "--output",
         type=Path,
-        default=Path("labels_wordcloud.png"),
-        help="Output PNG path (default: labels_wordcloud.png)",
+        default=Path("wordcloud.png"),
+        help="Base output PNG path; writes <stem>-feature<suffix> and <stem>-field<suffix>",
     )
     parser.add_argument("--width", type=int, default=1200, help="Image width in px")
     parser.add_argument("--height", type=int, default=800, help="Image height in px")
@@ -154,39 +232,61 @@ def main() -> int:
     cells = load_label_strings(args.input_path)
     if not cells:
         print(
-            "No label text found. For HTML exports, install: pandas lxml beautifulsoup4",
+            "No labels found.",
             file=sys.stderr,
         )
         return 1
 
-    freqs = build_frequencies(cells)
+    freqs_feature, freqs_field = build_feature_field_frequencies(cells)
     if args.min_count > 1:
-        freqs = {k: v for k, v in freqs.items() if v >= args.min_count}
+        freqs_feature = {k: v for k, v in freqs_feature.items() if v >= args.min_count}
+        freqs_field = {k: v for k, v in freqs_field.items() if v >= args.min_count}
 
-    if not freqs:
-        print("No label tokens after parsing (empty column or all filtered).", file=sys.stderr)
+    if not freqs_feature and not freqs_field:
+        print(
+            "No feature_* or field_* labels found (or all filtered by --min-count).",
+            file=sys.stderr,
+        )
         return 1
 
     from wordcloud import WordCloud
 
-    wc = WordCloud(
-        width=args.width,
-        height=args.height,
-        background_color=args.background,
-        colormap="viridis",
-        prefer_horizontal=0.7,
-    ).generate_from_frequencies(freqs)
+    def write_cloud(freqs: dict[str, int], out_path: Path) -> None:
+        wc = WordCloud(
+            width=args.width,
+            height=args.height,
+            background_color=args.background,
+            color_func=_wordcloud_color_func,
+            prefer_horizontal=0.7,
+        ).generate_from_frequencies(freqs)
+        plt.figure(figsize=(args.width / 100, args.height / 100), dpi=100)
+        plt.imshow(wc, interpolation="bilinear")
+        plt.axis("off")
+        plt.tight_layout(pad=0)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(out_path, bbox_inches="tight", pad_inches=0.1)
+        plt.close()
+        print(
+            f"Wrote {out_path} ({len(freqs)} distinct labels, {sum(freqs.values())} total label hits)."
+        )
 
-    plt.figure(figsize=(args.width / 100, args.height / 100), dpi=100)
-    plt.imshow(wc, interpolation="bilinear")
-    plt.axis("off")
-    plt.tight_layout(pad=0)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(args.output, bbox_inches="tight", pad_inches=0.1)
-    plt.close()
-    print(
-        f"Wrote {args.output} ({len(freqs)} distinct labels, {sum(freqs.values())} total label hits)."
-    )
+    base = args.output
+    out_feature = base.with_name(f"{base.stem}-feature{base.suffix}")
+    out_field = base.with_name(f"{base.stem}-field{base.suffix}")
+
+    if freqs_feature:
+        write_cloud(freqs_feature, out_feature)
+    else:
+        print("No feature_* labels; skipped feature word cloud.", file=sys.stderr)
+
+    if freqs_field:
+        write_cloud(freqs_field, out_field)
+    else:
+        print("No field_* labels; skipped field word cloud.", file=sys.stderr)
+
+    _print_occurrence_table("Features (occurrences, descending)", freqs_feature)
+    _print_occurrence_table("Fields (occurrences, descending)", freqs_field)
+
     return 0
 
 
