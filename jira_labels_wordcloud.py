@@ -7,7 +7,7 @@ reads the Labels column (and falls back to <td class="labels"> on HTML exports).
 
 Usage:
   pip install pandas lxml beautifulsoup4 matplotlib wordcloud openpyxl
-  python jira_labels_wordcloud.py "/path/to/Jira....xls" -o labels.png
+  python jira_labels_wordcloud.py "/path/to/Jira....xls" -o jira_labels_wordcloud.png
 
 Writes two PNGs: labels-feature.png and labels-field.png (only `feature_*` and `field_*`
 labels; prefixes are stripped and the remainder is shown in camelCase).
@@ -23,6 +23,7 @@ from collections import Counter
 from pathlib import Path
 
 import matplotlib
+import matplotlib.colors as mcolors
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
@@ -56,7 +57,6 @@ def load_label_strings(path: Path) -> list[str]:
 
     # Jira HTML export disguised as .xls / .xls
     if head.startswith(b"<") or b"issuetable" in raw[:8192]:
-        print("Jira HTML export detected")
         text = raw.decode("utf-8", errors="replace")
 
         try:
@@ -74,7 +74,6 @@ def load_label_strings(path: Path) -> list[str]:
             pass
 
         try:
-            print("BeautifulSoup detected")
             from bs4 import BeautifulSoup
 
             soup = BeautifulSoup(text, "lxml")
@@ -107,22 +106,10 @@ def split_jira_labels(cell: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
-def _suffix_to_camel_case(suffix: str) -> str:
-    """Turn text after feature_/field_ into lower camelCase (snake segments → camel)."""
-    suffix = suffix.strip()
-    if not suffix:
-        return ""
-    parts = [p for p in suffix.split("_") if p]
-    if not parts:
-        return ""
-    if len(parts) == 1:
-        p = parts[0]
-        return (p[0].lower() + p[1:]) if p else ""
-    first = parts[0].lower()
-    rest = "".join(
-        (seg[0].upper() + seg[1:].lower()) if seg else "" for seg in parts[1:]
-    )
-    return first + rest
+def to_title_case(s: str) -> str:
+    s = s.replace("_", " ")
+    s = re.sub(r"(?<!^)(?=[A-Z])", " ", s)
+    return s.title()
 
 
 def _strip_prefix_casefold(label: str, prefix: str) -> str | None:
@@ -142,13 +129,13 @@ def build_feature_field_frequencies(
         for label in split_jira_labels(cell):
             rest = _strip_prefix_casefold(label, feature_p)
             if rest is not None:
-                key = _suffix_to_camel_case(rest)
+                key = to_title_case(rest)
                 if key:
                     feature_c[key] += 1
                 continue
             rest = _strip_prefix_casefold(label, field_p)
             if rest is not None:
-                key = _suffix_to_camel_case(rest)
+                key = to_title_case(rest)
                 if key:
                     field_c[key] += 1
     return dict(feature_c), dict(field_c)
@@ -177,23 +164,6 @@ WORDCLOUD_COLORS = (
     "#A13829",
     "#E98709",
 )
-
-
-def _wordcloud_color_func(
-    word, font_size, position, orientation, random_state=None, **kwargs
-):
-    n = len(WORDCLOUD_COLORS)
-    if random_state is None:
-        return WORDCLOUD_COLORS[0]
-    # Python Random.randint is inclusive on both ends; NumPy uses a half-open range.
-    randrange = getattr(random_state, "randrange", None)
-    if randrange is not None:
-        i = int(randrange(n))
-    elif hasattr(random_state, "integers"):
-        i = int(random_state.integers(0, n))
-    else:
-        i = int(random_state.randint(0, n))
-    return WORDCLOUD_COLORS[i]
 
 
 def main() -> int:
@@ -256,8 +226,10 @@ def main() -> int:
             width=args.width,
             height=args.height,
             background_color=args.background,
-            color_func=_wordcloud_color_func,
-            prefer_horizontal=0.7,
+            # colormap="viridis",
+            colormap=mcolors.LinearSegmentedColormap.from_list(
+                "custom_cmap", WORDCLOUD_COLORS
+            ),
         ).generate_from_frequencies(freqs)
         plt.figure(figsize=(args.width / 100, args.height / 100), dpi=100)
         plt.imshow(wc, interpolation="bilinear")
@@ -284,8 +256,8 @@ def main() -> int:
     else:
         print("No field_* labels; skipped field word cloud.", file=sys.stderr)
 
-    _print_occurrence_table("Features (occurrences, descending)", freqs_feature)
-    _print_occurrence_table("Fields (occurrences, descending)", freqs_field)
+    _print_occurrence_table("Labels by Feature", freqs_feature)
+    _print_occurrence_table("Labels by Field", freqs_field)
 
     return 0
 
