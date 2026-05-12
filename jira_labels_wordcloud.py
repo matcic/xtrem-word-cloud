@@ -17,10 +17,26 @@ from __future__ import annotations
 
 import argparse
 import io
+import os
 import re
 import sys
 from collections import Counter
 from pathlib import Path
+
+
+def _persist_matplotlib_config_for_frozen() -> None:
+    """PyInstaller one-file uses a temp extract dir; default MPL config there is lost each run."""
+    if not getattr(sys, "frozen", False):
+        return
+    config = Path.home() / ".cache" / "jira-labels-wordcloud" / "matplotlib"
+    try:
+        config.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    os.environ.setdefault("MPLCONFIGDIR", str(config))
+
+
+_persist_matplotlib_config_for_frozen()
 
 import matplotlib
 import matplotlib.colors as mcolors
